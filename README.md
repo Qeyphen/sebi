@@ -17,7 +17,7 @@ SEBI produces stable, explainable JSON reports that help developers, auditors, a
 - [Report Format](#report-format)
 - [Project Structure](#project-structure)
 - [Testing](#testing)
-- [Design Principles](#design-principles)
+- [CI Integration](#ci-integration)
 - [Non-Goals](#non-goals)
 - [Documentation](#documentation)
 - [License](#license)
@@ -68,7 +68,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 **Build from source:**
 
 ```sh
-git clone https://github.com/aspect-build/sebi.git
+git clone https://github.com/qeyphen/sebi.git
 cd sebi
 cargo build --release
 ```
@@ -233,6 +233,8 @@ Reports conform to the schema in [`docs/SCHEMA.md`](docs/SCHEMA.md):
 sebi/
 ├── Cargo.toml                          # Workspace root
 ├── README.md
+├── examples/
+│   └── sebi-ci.yml                     # Sample GitHub Actions CI workflow
 ├── docs/
 │   ├── RULES.md                        # Rule catalog specification
 │   └── SCHEMA.md                       # Report schema specification
@@ -316,6 +318,62 @@ cargo test --package sebi-cli
 
 `sebi-cli` integration tests use pre-compiled WASM fixtures in `crates/sebi-cli/fixtures/` to test the binary end-to-end (exit codes, output formats, flag handling).
 
+## CI Integration
+
+SEBI's exit codes make it directly usable as a CI gate. A non-zero exit means risk was detected — no chain access or runtime environment is required.
+
+A complete, ready-to-use GitHub Actions workflow is provided at [`examples/sebi-ci.yml`](examples/sebi-ci.yml). Copy it into your project's `.github/workflows/` directory to enable SEBI as a pre-deployment check.
+
+### How the CI Workflow Works
+
+The sample workflow ([`examples/sebi-ci.yml`](examples/sebi-ci.yml)) runs on every push and pull request. It executes four stages:
+
+1. **Setup** — Checks out the repository, installs the Rust toolchain with `wasm32-unknown-unknown` target, installs `jq` for JSON processing, and caches the Cargo registry for faster subsequent runs.
+
+2. **Install SEBI** — Installs `sebi-cli` from the repository via `cargo install`. The binary is cached across runs, so subsequent CI invocations skip the build step.
+
+3. **Build Contracts** — Uses `cargo metadata` to automatically discover all workspace crates that produce `cdylib` targets (deployable Stylus contracts), then compiles them to WASM in release mode. This means the workflow adapts automatically as contracts are added or removed from the workspace — no manual list to maintain.
+
+4. **Run SEBI Analysis** — Iterates over every `.wasm` artifact in the release directory, runs `sebi-cli` on each one, and produces a per-contract JSON report in `reports/`. Each report includes the git commit SHA for traceability. The workflow collects all flagged contracts and fails the CI job if any contract is classified as `RISK` or `HIGH_RISK`. Flagged contracts are also reported via GitHub's `::error` annotation, which surfaces directly in the pull request UI. All JSON reports are uploaded as CI artifacts regardless of pass/fail status.
+
+### Quick Start
+
+To add SEBI to your Stylus project:
+
+```sh
+# Copy the sample workflow into your project
+mkdir -p .github/workflows
+cp examples/sebi-ci.yml .github/workflows/sebi.yml
+```
+
+The workflow requires no configuration — it discovers contracts automatically from your `Cargo.toml` workspace.
+
+### Gate Strategies
+
+| Strategy | Condition | Use case |
+|----------|-----------|----------|
+| Fail on `RISK` or `HIGH_RISK` | `level == "RISK" \|\| level == "HIGH_RISK"` | Default — block any flagged contract |
+| Fail on `HIGH_RISK` only | `level == "HIGH_RISK"` | Allow medium-risk patterns (loops, unbounded memory) |
+| Report only | Always exit 0, upload JSON report as CI artifact | Informational, no blocking |
+
+### JSON Reports in CI
+
+Generate and archive JSON reports with the git commit hash embedded:
+
+```yaml
+- name: Generate SEBI report
+  run: |
+    sebi-cli contract.wasm --format json \
+      --out sebi-report.json \
+      --commit ${{ github.sha }}
+
+- name: Upload report
+  uses: actions/upload-artifact@v4
+  with:
+    name: sebi-report
+    path: sebi-report.json
+```
+
 ## Non-Goals
 
 SEBI does **not** attempt to:
@@ -332,6 +390,7 @@ SEBI reports **structural execution-boundary signals only**.
 
 - [`docs/RULES.md`](docs/RULES.md) - rule catalog: trigger conditions, severities, evidence, classification policy
 - [`docs/SCHEMA.md`](docs/SCHEMA.md) - report schema: field specifications, types, determinism guarantees
+- [`examples/sebi-ci.yml`](examples/sebi-ci.yml) - sample GitHub Actions workflow for CI integration
 
 ## License
 

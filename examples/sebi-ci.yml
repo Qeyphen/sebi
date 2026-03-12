@@ -1,0 +1,134 @@
+name: SEBI Analysis
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  sebi-check:
+    name: SEBI Contract Inspection
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin
+          key: ${{ runner.os }}-cargo-sebi-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-sebi-
+
+      - name: Install SEBI
+        run: |
+          if ! command -v sebi-cli &> /dev/null; then
+            cargo install --git https://github.com/qeyphen/sebi --bin sebi-cli
+          fi
+
+      - name: Build Stylus contracts
+        run: |
+          # Find all workspace crates that produce cdylib targets (deployable contracts)
+          PACKAGES=$(cargo metadata --format-version 1 --no-deps \
+            | jq -r '.packages[]
+              | select(.targets[] | .kind[] | . == "cdylib")
+              | .name' \
+            | sort -u)
+
+          if [ -z "$PACKAGES" ]; then
+            echo "ERROR: no cdylib crates found in workspace"
+            exit 1
+          fi
+
+          ARGS=""
+          for pkg in $PACKAGES; do
+            ARGS="$ARGS -p $pkg"
+            echo "  will build: $pkg"
+          done
+
+          cargo build \
+            --release \
+            --target wasm32-unknown-unknown \
+            $ARGS
+
+          if [ ! -d target/wasm32-unknown-unknown/release ]; then
+            echo "ERROR: no wasm artifacts produced"
+            exit 1
+          fi
+
+      # Run SEBI against every .wasm in target/
+
+      - name: Run SEBI analysis
+        run: |
+          mkdir -p reports
+          FAILED_NAMES=()
+          FAILED_DETAILS=()
+
+          mapfile -d '' wasm_files < <(find target/wasm32-unknown-unknown/release -maxdepth 1 -name "*.wasm" -not -name "*.d" -print0)
+          if [ ${#wasm_files[@]} -eq 0 ]; then
+            echo "ERROR: no .wasm artifacts found in target/"
+            exit 1
+          fi
+
+          for wasm in "${wasm_files[@]}"; do
+            name=$(basename "$wasm" .wasm)
+
+            sebi-cli "$wasm" \
+              --format json \
+              --out "reports/${name}.json" \
+              --commit "${{ github.sha }}" || true
+
+            LEVEL=$(jq -r '.classification.level' "reports/${name}.json")
+            RULES=$(jq -r '
+              .rules.triggered
+              | map("      \(.rule_id) [\(.severity)] \(.title)")
+              | join("\n")
+            ' "reports/${name}.json")
+
+            echo "  $name → $LEVEL"
+            if [ -n "$RULES" ]; then
+              echo "$RULES"
+            fi
+
+            if [ "$LEVEL" = "RISK" ] || [ "$LEVEL" = "HIGH_RISK" ]; then
+              FAILED_NAMES+=("$name")
+              FAILED_DETAILS+=("$name ($LEVEL):\n$RULES")
+              echo "::error file=$wasm::SEBI $LEVEL — $name"
+            fi
+          done
+
+          echo ""
+          if [ ${#FAILED_NAMES[@]} -eq 0 ]; then
+            echo "All contracts passed SEBI gate."
+            exit 0
+          fi
+
+          echo "SEBI gate failed. The following contracts were flagged:"
+          echo ""
+          for detail in "${FAILED_DETAILS[@]}"; do
+            printf "  ✗ %b\n" "$detail"
+            echo ""
+          done
+          exit 1
+
+      - name: Upload SEBI reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sebi-reports
+          path: reports/
